@@ -1,0 +1,3 @@
+[15:58:43.017] python .\train.py
+[15:58:43.018] Namespace(dataset='fundus', save_name='debug', overwrite=True, model='unet', max_iterations=60000, num_eval_iter=500, deterministic=1, base_lr=0.03, seed=1337, gpu='0', load=False, load_path='../model/lb1_ratio0.2/iter_6000.pth', threshold=0.95, amp=1, label_bs=4, unlabel_bs=4, test_bs=1, domain_num=6, lb_domain=1, lb_num=40, ema_decay=0.99, consistency_type='mse', consistency=1.0, consistency_rampup=200.0, depth=28, widen_factor=2, leaky_slope=0.1, bn_momentum=0.1, dropout=0.0, cutmix_prob=1.0, LB=0.01)
+[15:58:43.706] 500 iterations per epoch

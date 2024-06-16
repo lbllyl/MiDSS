@@ -28,9 +28,9 @@ from torch.optim.lr_scheduler import LambdaLR
 import math
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', type=str, default='fundus', choices=['fundus', 'prostate'])
+parser.add_argument('--dataset', type=str, default='MNMS')
 parser.add_argument("--save_name", type=str, default="debug", help="experiment_name")
-parser.add_argument("--overwrite", default=True, action='store_true')
+parser.add_argument("--overwrite", action='store_true')
 parser.add_argument("--model", type=str, default="unet", help="model_name")
 parser.add_argument("--max_iterations", type=int, default=60000, help="maximum epoch number to train")
 parser.add_argument('--num_eval_iter', type=int, default=500)
@@ -47,9 +47,9 @@ parser.add_argument('--amp', type=int, default=1, help='use mixed precision trai
 parser.add_argument("--label_bs", type=int, default=4, help="labeled_batch_size per gpu")
 parser.add_argument("--unlabel_bs", type=int, default=4)
 parser.add_argument("--test_bs", type=int, default=1)
-parser.add_argument('--domain_num', type=int, default=6)
+parser.add_argument('--domain_num', type=int, default=4)
 parser.add_argument('--lb_domain', type=int, default=1)
-parser.add_argument('--lb_num', type=int, default=40)
+parser.add_argument('--lb_num', type=int, default=20)
 # costs
 parser.add_argument("--ema_decay", type=float, default=0.99, help="ema_decay")
 parser.add_argument("--consistency_type", type=str, default="mse", help="consistency_type")
@@ -195,14 +195,10 @@ def source_to_target_freq( src_img, amp_trg, L=0.1, degree=1 ):
     return src_in_trg #.transpose(1, 2, 0)
 
 
-if args.dataset == 'fundus':
-    part = ['cup', 'disc']
-    dataset = FundusSegmentation
-elif args.dataset == 'prostate':
-    part = ['base'] 
-    dataset = ProstateSegmentation
+part = ['lv', 'myo', 'rv'] 
+dataset = MNMSSegmentation
 n_part = len(part)
-dice_calcu = {'fundus':metrics.dice_coeff_2label, 'prostate':metrics.dice_coeff}
+dice_calcu = metrics.dice_coeff_3label
 
 def obtain_cutmix_box(img_size, p=0.5, size_min=0.02, size_max=0.4, ratio_1=0.3, ratio_2=1/0.3):
     mask = torch.zeros(img_size, img_size).cuda()
@@ -224,6 +220,15 @@ def obtain_cutmix_box(img_size, p=0.5, size_min=0.02, size_max=0.4, ratio_1=0.3,
 
     return mask
 
+def to_3d(input_tensor):
+        input_tensor = input_tensor.unsqueeze(1)
+        tensor_list = []
+        for i in range(1, 4):
+            temp_prob = input_tensor == i * torch.ones_like(input_tensor)
+            tensor_list.append(temp_prob)
+        output_tensor = torch.cat(tensor_list, dim=1)
+        return output_tensor.float()
+
 @torch.no_grad()
 def test(args, model, test_dataloader, epoch, writer, ema=True):
     model.eval()
@@ -232,13 +237,9 @@ def test(args, model, test_dataloader, epoch, writer, ema=True):
     val_dice = [0.0] * n_part
     domain_metrics = []
     domain_num = len(test_dataloader)
-    if args.dataset == 'fundus':
-        ce_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
-        softmax, sigmoid, multi = False, True, True
-    elif args.dataset == 'prostate':
-        ce_loss = CrossEntropyLoss(reduction='none')
-        softmax, sigmoid, multi = True, False, False
-    dice_loss = losses.DiceLossWithMask(2)
+    ce_loss = CrossEntropyLoss(reduction='none')
+    softmax, sigmoid, multi = True, False, False
+    dice_loss = losses.DiceLossWithMask(4)
     for i in range(domain_num):
         cur_dataloader = test_dataloader[i]
         dc = -1
@@ -248,21 +249,17 @@ def test(args, model, test_dataloader, epoch, writer, ema=True):
             dc = sample['dc'][0].item()
             data = sample['image'].cuda()
             mask = sample['label'].cuda()
-            if args.dataset == 'fundus':
-                cup_mask = mask.eq(0).float()
-                disc_mask = mask.le(128).float()
-                mask = torch.cat((cup_mask.unsqueeze(1), disc_mask.unsqueeze(1)),dim=1)
-            elif args.dataset == 'prostate':
-                mask = mask.eq(0).long()
+            mask_ = mask[:,...,0].eq(255).float()
+            mask_[mask[:,...,1].eq(255)] = 2
+            mask_[mask[:,...,2].eq(255)] = 3
+            mask = mask_.long()
             output = model(data)
             loss_seg = ce_loss(output, mask).mean() + \
                         dice_loss(output, mask.unsqueeze(1), softmax=softmax, sigmoid=sigmoid, multi=multi)
 
             
-            if args.dataset == 'fundus':
-                dice = dice_calcu[args.dataset](np.asarray(torch.sigmoid(output.cpu()))>=0.5,mask.clone().cpu())
-            elif args.dataset == 'prostate':
-                dice = dice_calcu[args.dataset](np.asarray(torch.max(torch.softmax(output.cpu(),dim=1), dim=1)[1]),mask.clone().cpu())
+            pred_label = torch.max(torch.softmax(output,dim=1), dim=1)[1]
+            dice = dice_calcu(np.asarray(pred_label.cpu()),mask.clone().cpu())
             
             domain_val_loss += loss_seg.item()
             for i in range(len(domain_val_dice)):
@@ -302,28 +299,17 @@ def train(args, snapshot_path):
     writer = SummaryWriter(snapshot_path + '/log')
     base_lr = args.base_lr
 
-    if args.dataset == 'fundus':
-        num_channels = 3
-        patch_size = 256
-        num_classes = 2
-        args.label_bs = 4
-        args.unlabel_bs = 4
-        min_v, max_v = 0.5, 1.5
-        fillcolor = 255
-        args.max_iterations = 30000
-        if args.domain_num >=4:
-            args.domain_num = 4
-    elif args.dataset == 'prostate':
-        num_channels = 1
-        patch_size = 384
-        num_classes = 2
-        args.label_bs = 4
-        args.unlabel_bs = 4
-        min_v, max_v = 0.1, 2
-        fillcolor = 255
-        args.max_iterations = 60000
-        if args.domain_num >= 6:
-            args.domain_num = 6
+    
+    num_channels = 1
+    patch_size = 288
+    num_classes = 4
+    args.label_bs = 4
+    args.unlabel_bs = 4
+    min_v, max_v = 0.1, 2
+    fillcolor = 0
+    args.max_iterations = 60000
+    if args.domain_num >= 4:
+        args.domain_num = 4
 
     max_iterations = args.max_iterations
     weak = transforms.Compose([tr.RandomScaleCrop(patch_size),
@@ -345,10 +331,7 @@ def train(args, snapshot_path):
 
     domain_num = args.domain_num
     domain = list(range(1,domain_num+1))
-    if args.dataset == 'fundus':
-        domain_len = [50, 99, 320, 320]
-    elif args.dataset == 'prostate':
-        domain_len = [225, 305, 136, 373, 338, 133]
+    domain_len = [1030, 1342, 525, 550]
     lb_domain = args.lb_domain
     data_num = domain_len[lb_domain-1]
     lb_num = args.lb_num
@@ -388,12 +371,8 @@ def train(args, snapshot_path):
     optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
 
     # set to train
-    if args.dataset == 'fundus':
-        ce_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
-        softmax, sigmoid, multi = False, True, True
-    elif args.dataset == 'prostate':
-        ce_loss = CrossEntropyLoss(reduction='none')
-        softmax, sigmoid, multi = True, False, False
+    ce_loss = CrossEntropyLoss(reduction='none')
+    softmax, sigmoid, multi = True, False, False
     dice_loss = losses.DiceLossWithMask(num_classes)
 
     logging.info("{} iterations per epoch".format(args.num_eval_iter))
@@ -448,56 +427,39 @@ def train(args, snapshot_path):
             move_transx = move_transx.cuda()
 
             lb_x_w, lb_y, ulb_x_w, ulb_x_s, ulb_y = lb_x_w.cuda(), lb_y.cuda(), ulb_x_w.cuda(), ulb_x_s.cuda(), ulb_y.cuda()
-            if args.dataset == 'fundus':
-                lb_cup_label = lb_y.eq(0).float() # == 0
-                lb_disc_label = lb_y.le(128).float()  # <= 128
-                lb_mask = torch.cat((lb_cup_label.unsqueeze(1), lb_disc_label.unsqueeze(1)),dim=1)
-                ulb_cup_label = ulb_y.eq(0).float()
-                ulb_disc_label = ulb_y.le(128).float()
-                ulb_mask = torch.cat((ulb_cup_label.unsqueeze(1), ulb_disc_label.unsqueeze(1)),dim=1)
-            elif args.dataset == 'prostate':
-                lb_mask = lb_y.eq(0).long()
-                ulb_mask = ulb_y.eq(0).long()
+            
+            lb_mask = lb_y[:,...,0].eq(255).float()
+            lb_mask[lb_y[:,...,1].eq(255)] = 2
+            lb_mask[lb_y[:,...,2].eq(255)] = 3
+            lb_mask = lb_mask.long()
+            ulb_mask = ulb_y[:,...,0].eq(255).float()
+            ulb_mask[ulb_y[:,...,1].eq(255)] = 2
+            ulb_mask[ulb_y[:,...,2].eq(255)] = 3
+            ulb_mask = ulb_mask.long()
 
             with amp_cm():
                 with torch.no_grad():
                     label_box = torch.stack([obtain_cutmix_box(img_size=patch_size, p=args.cutmix_prob) for i in range(len(ulb_x_s))], dim=0)
                     img_box = label_box.unsqueeze(1)
-                    if args.dataset == 'fundus':
-                        label_box = label_box.unsqueeze(1)
                     logits_ulb_x_w = ema_model(ulb_x_w)
                     ulb_x_w_ul = ulb_x_w * (1-img_box) + lb_x_w * img_box
                     logits_w_ul = ema_model(ulb_x_w_ul)
                     ulb_x_w_lu = lb_x_w * (1-img_box) + ulb_x_w * img_box
                     logits_w_lu = ema_model(ulb_x_w_lu)
-                    if args.dataset == 'fundus':
-                        prob = logits_ulb_x_w.sigmoid()
-                        pseudo_label = prob.ge(0.5).float()
-                        mask = prob.ge(threshold).float() + prob.le(1-threshold).float()
-                        prob_w_ul = logits_w_ul.sigmoid()
-                        pseudo_label_w_ul = prob_w_ul.ge(0.5).float()
-                        mask_w_ul = prob_w_ul.ge(threshold).float() + prob_w_ul.le(1-threshold).float()
-                        prob_w_lu = logits_w_lu.sigmoid()
-                        pseudo_label_w_lu = prob_w_lu.ge(0.5).float()
-                        mask_w_lu = prob_w_lu.ge(threshold).float() + prob_w_lu.le(1-threshold).float()
-                    elif args.dataset == 'prostate':
-                        prob_ulb_x_w = torch.softmax(logits_ulb_x_w, dim=1)
-                        prob, pseudo_label = torch.max(prob_ulb_x_w, dim=1)
-                        mask = (prob > threshold).unsqueeze(1).float()
-                        prob_w_ul = torch.softmax(logits_w_ul, dim=1)
-                        conf_w_ul, pseudo_label_w_ul = torch.max(prob_w_ul, dim=1)
-                        mask_w_ul = (conf_w_ul > threshold).unsqueeze(1).float()
-                        prob_w_lu = torch.softmax(logits_w_lu, dim=1)
-                        conf_w_lu, pseudo_label_w_lu = torch.max(prob_w_lu, dim=1)
-                        mask_w_lu = (conf_w_lu > threshold).unsqueeze(1).float()
+
+                    prob_ulb_x_w = torch.softmax(logits_ulb_x_w, dim=1)
+                    prob, pseudo_label = torch.max(prob_ulb_x_w, dim=1)
+                    mask = (prob > threshold).unsqueeze(1).float()
+                    prob_w_ul = torch.softmax(logits_w_ul, dim=1)
+                    conf_w_ul, pseudo_label_w_ul = torch.max(prob_w_ul, dim=1)
+                    mask_w_ul = (conf_w_ul > threshold).unsqueeze(1).float()
+                    prob_w_lu = torch.softmax(logits_w_lu, dim=1)
+                    conf_w_lu, pseudo_label_w_lu = torch.max(prob_w_lu, dim=1)
+                    mask_w_lu = (conf_w_lu > threshold).unsqueeze(1).float()
 
                     mask_w = mask_w_ul * (1-img_box) + mask_w_lu * img_box
                     pseudo_label_w = (pseudo_label_w_ul * (1-label_box) + pseudo_label_w_lu * label_box).long()
-                    if args.dataset == 'fundus':
-                        pseudo_label_w = pseudo_label_w.float()
-                        ensemble = (pseudo_label_w == pseudo_label).float() * mask
-                    elif args.dataset == 'prostate':
-                        ensemble = (pseudo_label_w == pseudo_label).unsqueeze(1).float() * mask
+                    ensemble = (pseudo_label_w == pseudo_label).unsqueeze(1).float() * mask
                     mask_w[ensemble == 0] = 0
 
                 mask_ul, mask_lu = mask.clone(), mask.clone()
@@ -506,9 +468,6 @@ def train(args, snapshot_path):
                 mask_ul[img_box.expand(mask_ul.shape) == 1] = 1
                 ulb_x_s_lu = move_transx * (1-img_box) + ulb_x_s * img_box
                 pseudo_label_lu = (lb_mask * (1-label_box) + pseudo_label * label_box).long()
-                if args.dataset == 'fundus':
-                    pseudo_label_ul = pseudo_label_ul.float()
-                    pseudo_label_lu = pseudo_label_lu.float()
                 mask_lu[img_box.expand(mask_lu.shape) == 0] = 1
                 # outputs for model
                 logits_lb_x_w = model(lb_x_w)
@@ -564,12 +523,8 @@ def train(args, snapshot_path):
             if p_bar is not None:
                 p_bar.update()
 
-            if args.dataset == 'fundus':
-                p_bar.set_description('iteration %d: loss:%.4f,sup_loss:%.4f, unsup_loss_ul:%f, unsup_loss_lu:%f, cons_w:%.4f,mask_ratio:%.4f' 
-                                        % (iter_num, loss.item(), sup_loss.item(), unsup_loss_ul.item(), unsup_loss_lu.item(), consistency_weight, mask.mean()))
-            elif args.dataset == 'prostate':
-                p_bar.set_description('iteration %d : loss:%.3f, sup_loss:%.3f, unsup_loss_ul:%.3f, unsup_loss_lu:%.3f, unsup_loss_s:%.3f, cons_w:%.3f, mask_ratio:%.3f' 
-                                    % (iter_num, loss.item(), sup_loss.item(), unsup_loss_ul.item(), unsup_loss_lu.item(), unsup_loss_s.item(), consistency_weight, mask.mean()))
+            p_bar.set_description('iteration %d: loss:%.3f,sup_loss:%.3f,unsup_loss_ul:%.3f,unsup_loss_lu:%.3f,unsup_loss_s:%.3f,cons_w:%.3f, mask_ratio:%.3f' 
+                                % (iter_num, loss.item(), sup_loss.item(), unsup_loss_ul.item(), unsup_loss_lu.item(), unsup_loss_s.item(), consistency_weight, mask.mean()))
 
         if p_bar is not None:
             p_bar.close()
@@ -629,11 +584,11 @@ def train(args, snapshot_path):
 if __name__ == "__main__":
     snapshot_path = "../model/" + args.dataset + "/" + args.save_name + "/"
     if args.dataset == 'fundus':
-        train_data_path='../data/Fundus'
+        train_data_path='../../data/Fundus'
     elif args.dataset == 'prostate':
-        train_data_path="../data/ProstateSlice"
+        train_data_path="../../data/ProstateSlice"
     elif args.dataset == 'MNMS':
-        train_data_path="../data/MNMS/mnms"
+        train_data_path="../../data/MNMS/mnms"
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 

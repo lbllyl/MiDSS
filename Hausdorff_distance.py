@@ -48,7 +48,7 @@ image_path2 = 'C:\\Users\\99345\\Desktop\\MiDSS\\data\\Fundus\\Domain1\\train\\R
 # 加载原图
 image1 = load_image(image_path1)
 image2 = load_image(image_path2)
-
+breakpoint()
 # 边缘检测
 edges1 = edge_detect(image1)
 edges2 = edge_detect(image2)

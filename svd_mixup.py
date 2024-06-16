@@ -24,8 +24,10 @@ def svd_and_swap_channels(image1, image2):
         U2, S2, V2T = np.linalg.svd(image2[:, :, i], full_matrices=False)
         
         # 创建新图像，通过交换V矩阵
-        new_image1[:, :, i] = np.dot(np.dot(U2, np.diag(S1)), V2T)
-        new_image2[:, :, i] = np.dot(np.dot(U1, np.diag(S2)), V1T)
+        new_image1[:, :, i] = np.dot(np.dot(U1, np.diag(S2)), V1T)
+        new_image2[:, :, i] = np.dot(np.dot(U2, np.diag(S1)), V2T)
+        # new_image1[i, :, :] = np.dot(np.dot(U2, np.diag(S1)), V2T)
+        # new_image2[i, :, :] = np.dot(np.dot(U1, np.diag(S2)), V1T)
     
     return new_image1.astype(np.uint8), new_image2.astype(np.uint8)
 

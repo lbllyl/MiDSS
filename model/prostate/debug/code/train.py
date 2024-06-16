@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 import math
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', type=str, default='fundus', choices=['fundus', 'prostate'])
+parser.add_argument('--dataset', type=str, default='prostate', choices=['fundus', 'prostate'])
 parser.add_argument("--save_name", type=str, default="debug", help="experiment_name")
 parser.add_argument("--overwrite", default=True, action='store_true')
 parser.add_argument("--model", type=str, default="unet", help="model_name")
